@@ -42,9 +42,11 @@
 #include <limits>
 #include <numeric>
 #include <vector>
+#include <mutex>
 
 #include "openMVG/robust_estimation/rand_sampling.hpp"
 #include "third_party/histogram/histogram.hpp"
+#include "thread_pool.hpp"
 
 #ifndef START_PROF
 #define START_PROF(S) ;
@@ -137,7 +139,7 @@ public:
     const double dmaxThreshold = std::numeric_limits<double>::infinity(),
     const bool bquantified_nfa_evaluation = false
   ):
-    m_residuals(kernel.NumSamples()),
+    // m_residuals(kernel.NumSamples()),
     m_kernel(kernel),
     m_bquantified_nfa_evaluation(bquantified_nfa_evaluation),
     m_max_threshold(dmaxThreshold)
@@ -147,8 +149,8 @@ public:
     makelogcombi(Kernel::MINIMUM_SAMPLES, kernel.NumSamples(), m_logc_k, m_logc_n);
   };
 
-  std::vector<double> & residuals()
-  { return m_residuals;}
+  // std::vector<double> & residuals()
+  // { return m_residuals;}
 
   /**
    * @brief Evaluation of the NFA (Number of False Alarm)
@@ -169,13 +171,14 @@ public:
   bool ComputeNFA_and_inliers
   (
     std::vector<size_t> & inliers,
-    std::pair<double,double> & nfa_threshold
-  );
+    std::pair<double,double> & nfa_threshold,
+    std::vector<double> & m_residuals
+  ) const;
 
 private:
 
   /// residual array
-  std::vector<double> m_residuals;
+  // std::vector<double> m_residuals;
   /// [residual,index] array -> used in the exhaustive nfa computation mode
   std::vector<std::pair<double,int> > m_sorted_residuals;
 
@@ -198,8 +201,9 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
 (
     std::vector<size_t> & inliers,
     /// NFA and residual threshold
-    std::pair<double,double> & nfa_threshold
-)
+    std::pair<double,double> & nfa_threshold,
+    std::vector<double> & m_residuals
+) const
 {
   // A-Contrario computation of the most meaningful discrimination inliers/outliers.
   // Two computation mode are implemented:
@@ -261,8 +265,10 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
   }
   else // exhaustive computation
   {
+    std::vector<std::pair<double,int> > m_sorted_residuals;
     // Residuals sorting (ascending order while keeping original point indexes)
     {
+      
       m_sorted_residuals.clear();
       m_sorted_residuals.reserve(m_kernel.NumSamples());
       for (size_t i = 0; i < m_kernel.NumSamples(); ++i)
@@ -365,8 +371,6 @@ std::pair<double, double> ACRANSAC(const Kernel &kernel,
   // Possible sampling indices [0,..,nData] (will change in the optimization phase)
   std::vector<size_t> vec_index(nData);
   std::iota(vec_index.begin(), vec_index.end(), 0);
-  // Sample indices (used for model evaluation)
-  std::vector<size_t> vec_sample(sizeSample);
 
   const double maxThreshold = (precision==std::numeric_limits<double>::infinity()) ?
     std::numeric_limits<double>::infinity() :
@@ -396,112 +400,155 @@ std::pair<double, double> ACRANSAC(const Kernel &kernel,
 
   START_PROF(loop);
 
+  ThreadPool* work_pool = new ThreadPool(1);
+  //std::mutex vec_index_mutex, nIter_mutex, mode_mutex;
+  std::mutex loop_mutex;
+  using scope_lock_t = std::unique_lock<std::mutex>;
   //--
   // Main estimation loop.
   for (unsigned int iter=0; iter < nIter && iter < num_max_iteration; ++iter)
   {
-    START_PROF(uniformsample);
-    
-    // Get random samples
-    if (bACRansacMode)
-      UniformSample(sizeSample, vec_index, &vec_sample);
-    else
-      UniformSample(sizeSample, nData, &vec_sample);
+    work_pool->enqueue([&]() {
+      // START_PROF(uniformsample);
+      // scope_lock_t lock(loop_mutex);        
 
-    END_PROF(uniformsample);
-
-    START_PROF(fit);
+      // Sample indices (used for model evaluation)
+      std::vector<size_t> vec_sample(sizeSample);
     
-    // Fit model(s). Can find up to Kernel::MAX_MODELS solution(s)
-    std::vector<typename Kernel::Model> vec_models;
-    kernel.Fit(vec_sample, &vec_models);
-
-    END_PROF(fit);
-    
-    // Evaluate model(s)
-    START_PROF(evaluate_models);
-    
-    bool better = false;
-    for (unsigned int k = 0; k < static_cast<unsigned int>(vec_models.size()); ++k)
-    {
-      // Compute residual values
-      START_PROF(Errors);
-      kernel.Errors(vec_models[k], nfa_interface.residuals());
-      END_PROF(Errors);
-
-      if (!bACRansacMode)
+      // Get random samples
       {
-        // MAX-CONSENSUS checking (does a model with some support is existing)
-        unsigned int nInlier = 0;
-        for (size_t i = 0; i < nData; ++i)
+        // scope_lock_t lock(nIter_mutex);        
+        if (bACRansacMode)
         {
-         if (nfa_interface.residuals()[i] <= maxThreshold)
-          ++nInlier;
+          scope_lock_t lock(loop_mutex);        
+          // scope_lock_t lock(vec_index_mutex);
+          UniformSample(sizeSample, vec_index, &vec_sample);
         }
-        if (nInlier > 2.5 * sizeSample) // does the model is meaningful
-          bACRansacMode = true;
-        if (!bACRansacMode && nIter > nIterReserve*2)
-          nIter = 0;
+        else
+          UniformSample(sizeSample, nData, &vec_sample);
       }
 
-      if (bACRansacMode)
+      // END_PROF(uniformsample);
+
+      // START_PROF(fit);
+    
+      // Fit model(s). Can find up to Kernel::MAX_MODELS solution(s)
+      std::vector<typename Kernel::Model> vec_models;
+      kernel.Fit(vec_sample, &vec_models);
+
+      
+      // END_PROF(fit);
+    
+      // Evaluate model(s)
+      // START_PROF(evaluate_models);
+
+      std::vector<size_t> vec_inliers_tmp;
+    
+      bool better = false;
+      for (unsigned int k = 0; k < static_cast<unsigned int>(vec_models.size()); ++k)
       {
-        // NFA evaluation; If better than the previous: update scoring & inliers indices
-        START_PROF(computeNFA_and_inliers);
-        std::pair<double,double> nfa_threshold(minNFA, 0.0);
-        const bool b_better_model_found =
-          nfa_interface.ComputeNFA_and_inliers(vec_inliers, nfa_threshold);
-        END_PROF(computeNFA_and_inliers);
+        // Compute residual values
+        // START_PROF(Errors);
+        std::vector<double> residuals(kernel.NumSamples());
+        kernel.Errors(vec_models[k], residuals);
+        // END_PROF(Errors);
 
-        if (b_better_model_found)
+
+        if (!bACRansacMode)
         {
-          better = true;
-          minNFA = nfa_threshold.first;
-          errorMax = nfa_threshold.second;
-          if(model) *model = vec_models[k];
-
-          if(bVerbose)
+          // scope_lock_t lock(nIter_mutex);
+          // MAX-CONSENSUS checking (does a model with some support is existing)
+          unsigned int nInlier = 0;
+          for (size_t i = 0; i < nData; ++i)
           {
-            std::cout << "  nfa=" << minNFA
-              << " inliers=" << vec_inliers.size() << "/" << nData
-              << " precisionNormalized=" << errorMax
-              << " precision=" << kernel.unormalizeError(errorMax)
-              << " (iter=" << iter
-              << " ,sample=";
-            std::copy(vec_sample.begin(), vec_sample.end(),
-              std::ostream_iterator<size_t>(std::cout, ","));
-            std::cout << ")" << std::endl;
+            if (residuals[i] <= maxThreshold)
+              ++nInlier;
+          }
+          if (nInlier > 2.5 * sizeSample) // does the model is meaningful
+          {
+            scope_lock_t lock(loop_mutex);
+            bACRansacMode = true;
+          }
+          if (!bACRansacMode && nIter > nIterReserve*2)
+          {
+            scope_lock_t lock(loop_mutex);
+            nIter = 0;
+          }
+        }
+        
+        if (bACRansacMode)
+        {
+          // NFA evaluation; If better than the previous: update scoring & inliers indices
+          // START_PROF(computeNFA_and_inliers);
+          // vec_inliers_tmp.reserve(vec_inliers.size());
+
+          // scope_lock_t lock(nIter_mutex);
+          
+          std::pair<double,double> nfa_threshold(minNFA, 0.0);
+          const bool b_better_model_found =
+            nfa_interface.ComputeNFA_and_inliers(vec_inliers_tmp, nfa_threshold, residuals);
+          // END_PROF(computeNFA_and_inliers);
+
+          if (b_better_model_found)
+          {
+            scope_lock_t lock(loop_mutex);        
+            better = true;
+            minNFA = nfa_threshold.first;
+            errorMax = nfa_threshold.second;
+            vec_inliers = vec_inliers_tmp;
+            if(model) *model = vec_models[k];
+
+            if(bVerbose)
+            {
+              std::cout << "  nfa=" << minNFA
+                        << " inliers=" << vec_inliers.size() << "/" << nData
+                        << " precisionNormalized=" << errorMax
+                        << " precision=" << kernel.unormalizeError(errorMax)
+                        << " (iter=" << iter
+                        << " ,sample=";
+              std::copy(vec_sample.begin(), vec_sample.end(),
+                        std::ostream_iterator<size_t>(std::cout, ","));
+              std::cout << ")" << std::endl;
+            }
           }
         }
       }
-    }
 
-    END_PROF(evaluate_models);
+      // END_PROF(evaluate_models);
+      // scope_lock_t lock(loop_mutex);        
 
     
-    // ACRANSAC optimization: draw samples among best set of inliers so far
-    if (bACRansacMode && ((better && minNFA<0) || (iter+1==nIter && nIterReserve > 0)))
-    {
-      if (vec_inliers.empty())
+      // ACRANSAC optimization: draw samples among best set of inliers so far
+      if (bACRansacMode && ((better && minNFA<0) || (iter+1==nIter && nIterReserve > 0)))
       {
-        // No model found at all so far
-        ++nIter; // Continue to look for any model, even not meaningful
-        --nIterReserve;
-      }
-      else
-      {
-        // ACRANSAC optimization: draw samples among best set of inliers so far
-        vec_index = vec_inliers;
-        if(nIterReserve) {
+        scope_lock_t lock(loop_mutex);        
+        // scope_lock_t lock(nIter_mutex);
+        
+        if (vec_inliers.empty())
+        {
+          // No model found at all so far
+          ++nIter; // Continue to look for any model, even not meaningful
+          --nIterReserve;
+        }
+        else
+        {
+          // ACRANSAC optimization: draw samples among best set of inliers so far
+          // scope_lock_t lock(vec_index_mutex);
+          vec_index = vec_inliers_tmp;
+          if(nIterReserve) {
             // reduce the number of iteration
             // next iterations will be dedicated to local optimization
             nIter = iter + 1 + nIterReserve;
             nIterReserve = 0;
+          }
         }
       }
-    }
+      });
+
+    // work_pool->enqueue(lambda_iteration);
   }
 
+  delete work_pool;
   END_PROF(loop);
   
   if(minNFA >= 0) // no meaningful model found so far

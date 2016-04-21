@@ -100,7 +100,7 @@ ADD_SUBDIRECTORY(easyexif)
 IF (DEFINED OpenMVG_USE_INTERNAL_EIGEN)
   #Configure Eigen install
   SET(EIGEN_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_PREFIX}/include/openMVG/third_party/eigen)
-  ADD_SUBDIRECTORY(eigen)
+  #ADD_SUBDIRECTORY(eigen)
 ENDIF()
 
 LIST(APPEND directories cmdLine histogram htmlDoc progress tinythread vectorGraphics)
